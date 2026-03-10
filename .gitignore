@@ -29,3 +29,9 @@ engines/
 *.whl
 test_image.jpg
 test_output.json
+test_audio.*
+whisper/onnx/
+whisper/engines/
+whisper/integration_input.json
+whisper/integration_output.json
+whisper/generate_test_audio.py
