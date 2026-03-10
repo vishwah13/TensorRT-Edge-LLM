@@ -20,3 +20,12 @@ docs/build/
 docs/source/cpp_api/
 docs/source/cpp_api.rst
 docs/source/python_api.rst
+
+# Large model artifacts (don't commit to git)
+models/
+onnx_models/
+engines/
+*.safetensors
+*.whl
+test_image.jpg
+test_output.json

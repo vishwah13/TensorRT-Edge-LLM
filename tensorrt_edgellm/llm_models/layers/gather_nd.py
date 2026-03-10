@@ -25,15 +25,22 @@ The module contains:
 - register_gather_nd_onnx_symbolic_functions: Function to register the custom operation with ONNX
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from torch.onnx import symbolic_helper
 
 from ...common import ONNX_OPSET_VERSION
 
+if TYPE_CHECKING:
+    from torch._C import Graph
+
 
 @symbolic_helper.parse_args("v", "v", "i")
 def symbolic_gather_nd(
-    g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
+    g: Graph,
     value: torch._C.Value,
     indices: torch._C.Value,
     batch_dims: int,

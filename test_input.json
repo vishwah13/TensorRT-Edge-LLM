@@ -1,0 +1,11 @@
+{
+  "requests": [{
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image", "image": "/workspace/test_image.jpg"},
+        {"type": "text", "text": "Describe this image in detail."}
+      ]
+    }]
+  }]
+}

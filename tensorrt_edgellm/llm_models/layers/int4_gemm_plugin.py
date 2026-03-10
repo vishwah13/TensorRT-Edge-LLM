@@ -25,8 +25,10 @@ The module contains:
 - ONNX export utilities for the custom operation
 """
 
+from __future__ import annotations
+
 import math
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 import onnx
@@ -102,7 +104,7 @@ onnx.defs.register_schema(int4_gemm_plugin_schema)
 
 @symbolic_helper.parse_args("v", "v", "v", "i", "i", "i")
 def symbolic_int4_gemm_plugin(
-    g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
+    g: Graph,
     input: torch._C.Value,
     qweight: torch._C.Value,
     scales: torch._C.Value,

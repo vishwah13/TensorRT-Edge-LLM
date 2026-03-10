@@ -24,7 +24,9 @@ The module contains:
 - ONNX export utilities for the custom operation
 """
 
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import onnx
 import torch
@@ -153,7 +155,7 @@ onnx.defs.register_schema(attention_plugin_schema)
 @symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "b",
                             "v", "v", "v")
 def symbolic_attention_plugin(
-    g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
+    g: Graph,
     qkv: torch._C.Value,
     past_key_value: torch._C.Value,
     context_lengths: torch._C.Value,
