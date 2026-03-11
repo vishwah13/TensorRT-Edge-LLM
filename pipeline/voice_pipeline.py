@@ -156,6 +156,8 @@ class WhisperASRSpeculative:
                 input_features=features,
                 assistant_model=self.assistant,
                 max_new_tokens=WHISPER_MAX_TOKENS,
+                language="en",
+                task="transcribe",
             )
         torch.cuda.synchronize()
         latency = (time.perf_counter() - t0) * 1000
@@ -500,8 +502,8 @@ def parse_args():
     # Audio devices
     parser.add_argument("--mic", default="hw:0,0",
                         help="ALSA mic device (default: hw:0,0 = Brio 100)")
-    parser.add_argument("--speaker", default="hw:1,3",
-                        help="ALSA speaker device (default: hw:1,3 = HDMI monitor)")
+    parser.add_argument("--speaker", default="plughw:1,3",
+                        help="ALSA speaker device (default: plughw:1,3 = HDMI monitor, auto mono->stereo)")
     parser.add_argument("--record-seconds", type=int, default=5,
                         help="Seconds to record per turn (default: 5)")
 

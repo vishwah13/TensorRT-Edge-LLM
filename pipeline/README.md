@@ -30,7 +30,7 @@ python3 pipeline/voice_pipeline.py \
   --fast-engine \
   --whisper-speculative \
   --mic hw:0,0 \
-  --speaker hw:1,3 \
+  --speaker plughw:1,3 \
   --record-seconds 5
 ```
 
@@ -43,7 +43,7 @@ Press **Enter** to record, speak, and the assistant replies through the speaker.
 | Device | ALSA ID | Description |
 |--------|---------|-------------|
 | Mic | `hw:0,0` | Brio 100 USB webcam microphone |
-| Speaker | `hw:1,3` | HDMI output to monitor |
+| Speaker | `plughw:1,3` | HDMI output to monitor |
 
 ---
 
@@ -100,7 +100,7 @@ LLM:
 
 Audio:
   --mic DEVICE            ALSA capture device (default: hw:0,0)
-  --speaker DEVICE        ALSA playback device (default: hw:1,3)
+  --speaker DEVICE        ALSA playback device (default: plughw:1,3)
   --record-seconds N      Recording duration per turn (default: 5)
 
 Output:
