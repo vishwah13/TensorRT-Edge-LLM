@@ -543,7 +543,9 @@ def build_pipeline(args):
     if args.no_tts:
         tts = PiperTTS.__new__(PiperTTS)
         tts._available = False
-        tts.synthesize_and_play = lambda text: (print(f"  [no-tts] {text}"), 0)[1]
+        tts._voice = None
+        tts.synthesize = lambda text: (None, 0)
+        tts.synthesize_and_play = lambda text, speaker_device=None: 0
     else:
         tts = PiperTTS(voice_name=args.voice)
 
