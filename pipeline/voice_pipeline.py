@@ -32,6 +32,7 @@ Usage:
 import argparse
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -39,6 +40,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from queue import Queue
 
 import torch
@@ -291,6 +293,85 @@ class PiperTTS:
         return synth_ms + play_ms
 
 
+def _alsa_to_sounddevice_index(alsa_device):
+    """Map ALSA hw:N,M device string to sounddevice device index.
+
+    Parses card N from hw:N,M, looks up the card name in /proc/asound/cards,
+    then matches against sounddevice.query_devices() by name substring.
+    Returns None (system default) if no match found.
+    """
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return None
+
+    # Parse card number from hw:N,M or plughw:N,M
+    import re as _re
+    m = _re.search(r':(\d+)', alsa_device)
+    if not m:
+        return None
+    card_num = int(m.group(1))
+
+    # Read card name from /proc/asound/cards
+    card_name = None
+    try:
+        with open("/proc/asound/cards") as f:
+            for line in f:
+                # Lines like: " 0 [B100           ]: ..."
+                cm = _re.match(r'\s*(\d+)\s+\[(\S+)', line)
+                if cm and int(cm.group(1)) == card_num:
+                    card_name = cm.group(2).lower().strip()
+                    break
+    except OSError:
+        pass
+
+    devices = sd.query_devices()
+    # Try matching by card name substring
+    if card_name:
+        for i, dev in enumerate(devices):
+            if card_name in dev["name"].lower() and dev["max_input_channels"] > 0:
+                return i
+
+    # Fallback: try "brio" substring (known mic)
+    for i, dev in enumerate(devices):
+        if "brio" in dev["name"].lower() and dev["max_input_channels"] > 0:
+            return i
+
+    print(f"[VAD] Could not map {alsa_device} to sounddevice. Available input devices:")
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            print(f"  [{i}] {dev['name']}")
+    return None
+
+
+class SileroVAD:
+    """Silero VAD wrapper for real-time speech detection."""
+
+    CHUNK_SAMPLES = 512   # required by Silero at 16kHz (32ms)
+    SAMPLE_RATE = 16000
+    SPEECH_THRESHOLD = 0.5
+
+    def __init__(self):
+        import urllib.request
+        model_cache = os.path.expanduser("~/.cache/silero_vad.jit")
+        if not os.path.exists(model_cache):
+            url = ("https://github.com/snakers4/silero-vad/raw/master"
+                   "/src/silero_vad/data/silero_vad.jit")
+            print("[VAD] Downloading Silero VAD model (~2MB)...")
+            urllib.request.urlretrieve(url, model_cache)
+        self._model = torch.jit.load(model_cache, map_location="cpu")
+        self._model.eval()  # CPU-only — keeps GPU free for Whisper/LLM
+
+    def reset(self):
+        """Clear LSTM state between utterances."""
+        self._model.reset_states()
+
+    def is_speech(self, chunk_float32: torch.Tensor) -> float:
+        """Return speech probability for a 512-sample float32 chunk."""
+        with torch.no_grad():
+            return self._model(chunk_float32, self.SAMPLE_RATE).item()
+
+
 def split_sentences(text):
     """Split text into sentence chunks for incremental TTS."""
     # Split on sentence-ending punctuation followed by space or end
@@ -474,6 +555,174 @@ class VoicePipeline:
             os.unlink(audio_path)
         return None
 
+    def _chunks_to_wav(self, chunks, sample_rate=16000):
+        """Join int16 byte chunks into a WAV temp file. Returns path or None if too short."""
+        raw = b"".join(chunks)
+        # Minimum 300ms of audio
+        min_bytes = int(sample_rate * 0.3) * 2  # 2 bytes per int16 sample
+        if len(raw) < min_bytes:
+            return None
+        wav_path = tempfile.mktemp(suffix=".wav")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(raw)
+        return wav_path
+
+    def live_loop(self, image_path=None, mic_device=None, speaker_device=None,
+                  silence_duration=1.5, vad_threshold=0.5):
+        """Continuous live conversation using Silero VAD for speech detection.
+
+        Streams mic via arecord (no PortAudio needed), auto-detects speech
+        start/stop, then processes through full ASR → LLM → TTS pipeline.
+        Press Ctrl+C to exit.
+        """
+        import numpy as np
+
+        vad = SileroVAD()
+        CHUNK = SileroVAD.CHUNK_SAMPLES
+        CHUNK_BYTES = CHUNK * 2  # int16 = 2 bytes/sample
+        SR = SileroVAD.SAMPLE_RATE
+        SILENCE_CHUNKS = int(silence_duration * SR / CHUNK)
+        MIN_SPEECH_CHUNKS = 5   # ~160ms — ignore brief noise spikes
+        PRE_BUFFER_SIZE = 100   # rolling pre-roll so first syllable isn't clipped
+
+        audio_q = queue.Queue(maxsize=200)
+        is_playing = threading.Event()
+        stop_event = threading.Event()
+
+        def reader_thread():
+            """Read mic audio in CHUNK_BYTES blocks via arecord or ffmpeg."""
+            import shutil
+            if shutil.which("arecord"):
+                cmd = ["arecord", "-f", "S16_LE", "-r", str(SR), "-c", "1"]
+                if mic_device:
+                    cmd += ["-D", mic_device]
+                cmd.append("-")
+            elif shutil.which("ffmpeg"):
+                cmd = ["ffmpeg", "-f", "alsa", "-i", mic_device or "default",
+                       "-f", "s16le", "-ar", str(SR), "-ac", "1",
+                       "-loglevel", "quiet", "-"]
+            else:
+                print("[VAD] No audio capture found. Install alsa-utils or ffmpeg.")
+                return
+
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            try:
+                while not stop_event.is_set():
+                    chunk = proc.stdout.read(CHUNK_BYTES)
+                    if not chunk or len(chunk) < CHUNK_BYTES:
+                        break
+                    if is_playing.is_set():
+                        continue  # discard during TTS playback
+                    try:
+                        audio_q.put_nowait(chunk)
+                    except queue.Full:
+                        pass
+            finally:
+                proc.terminate()
+                proc.wait()
+
+        print("\n" + "=" * 60)
+        print("  Voice Assistant - Live Mode (Silero VAD)")
+        print("=" * 60)
+        print(f"  Mic:      {mic_device or 'default'}")
+        print(f"  Speaker:  {speaker_device or 'default'}")
+        print(f"  Silence:  {silence_duration}s to end utterance")
+        print(f"  Threshold:{vad_threshold}")
+        print(f"  Image:    {image_path or 'none'}")
+        print("=" * 60)
+        print("\nListening... (Ctrl+C to exit)\n")
+
+        t = threading.Thread(target=reader_thread, daemon=True)
+        t.start()
+
+        turn = 0
+        try:
+            while True:
+                # State: WAITING — collect rolling pre-buffer
+                pre_buffer = deque(maxlen=PRE_BUFFER_SIZE)
+                speech_chunks = []
+                speech_count = 0
+                silence_count = 0
+                in_speech = False
+                vad.reset()
+
+                print("[Listening...]", end="", flush=True)
+
+                while True:
+                    try:
+                        chunk_bytes = audio_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+
+                    # Convert int16 bytes → float32 tensor for VAD
+                    chunk_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    chunk_tensor = torch.from_numpy(chunk_np)
+                    prob = vad.is_speech(chunk_tensor)
+
+                    if not in_speech:
+                        pre_buffer.append(chunk_bytes)
+                        if prob >= vad_threshold:
+                            speech_count += 1
+                            if speech_count >= MIN_SPEECH_CHUNKS:
+                                # Transition to SPEAKING
+                                in_speech = True
+                                silence_count = 0
+                                speech_chunks = list(pre_buffer)  # include pre-roll
+                                print(f"\n[Speech detected (p={prob:.2f})]", flush=True)
+                        else:
+                            speech_count = max(0, speech_count - 1)
+                    else:
+                        # SPEAKING — accumulate audio
+                        speech_chunks.append(chunk_bytes)
+
+                        if prob < vad_threshold:
+                            silence_count += 1
+                            if silence_count >= SILENCE_CHUNKS:
+                                # End of utterance
+                                print(f"[End of speech — {len(speech_chunks)} chunks]", flush=True)
+                                break
+                        else:
+                            silence_count = 0  # Speech resumed
+
+                # Drain queue so we don't process stale audio from next turn
+                while not audio_q.empty():
+                    try:
+                        audio_q.get_nowait()
+                    except queue.Empty:
+                        break
+
+                # Convert to WAV
+                wav_path = self._chunks_to_wav(speech_chunks, SR)
+                if wav_path is None:
+                    print("[Too short — ignoring]")
+                    continue
+
+                turn += 1
+                is_playing.set()  # Pause mic capture during processing + playback
+
+                try:
+                    timings = self.process(
+                        wav_path, image_path,
+                        speaker_device=speaker_device,
+                    )
+                    os.unlink(wav_path)
+
+                    print(f"\n  --- Turn {turn} Timing ---")
+                    for k, v in timings.items():
+                        if k.endswith("_ms"):
+                            print(f"    {k:<30s}: {v:,.0f}ms")
+                finally:
+                    is_playing.clear()  # Resume mic capture
+
+        except KeyboardInterrupt:
+            print("\n\nGoodbye!")
+        finally:
+            stop_event.set()
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Voice-to-voice pipeline")
@@ -506,6 +755,12 @@ def parse_args():
                         help="ALSA speaker device (default: plughw:1,3 = HDMI monitor, auto mono->stereo)")
     parser.add_argument("--record-seconds", type=int, default=5,
                         help="Seconds to record per turn (default: 5)")
+    parser.add_argument("--live", action="store_true",
+                        help="Auto-detect speech with Silero VAD (no Enter needed)")
+    parser.add_argument("--silence-duration", type=float, default=1.5,
+                        help="Seconds of silence to end utterance in --live mode (default: 1.5)")
+    parser.add_argument("--vad-threshold", type=float, default=0.5,
+                        help="VAD speech probability threshold 0-1 (default: 0.5)")
 
     # Output
     parser.add_argument("--save-audio", metavar="FILE",
@@ -594,8 +849,16 @@ def main():
             else:
                 print(f"  {k:30s}: {v}")
 
+    elif args.live:
+        pipeline.live_loop(
+            image_path=args.image,
+            mic_device=args.mic,
+            speaker_device=args.speaker,
+            silence_duration=args.silence_duration,
+            vad_threshold=args.vad_threshold,
+        )
     else:
-        # Interactive live mode
+        # Interactive push-to-talk mode
         pipeline.interactive_loop(
             image_path=args.image,
             record_seconds=args.record_seconds,

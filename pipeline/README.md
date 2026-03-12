@@ -24,17 +24,19 @@ docker run -it --gpus all --runtime nvidia --ipc=host \
 # Inside container — install deps (once)
 apt-get update -qq && apt-get install -y -qq ffmpeg alsa-utils
 pip install openai-whisper transformers accelerate piper-tts
+pip install silero-vad --no-deps   # --no-deps keeps CUDA torch 2.8.0 intact
 
-# Run live voice assistant
+# Run live conversation (VAD auto-detects speech — no button pressing)
 python3 pipeline/voice_pipeline.py \
+  --live \
   --fast-engine \
   --whisper-speculative \
   --mic hw:0,0 \
-  --speaker plughw:1,3 \
-  --record-seconds 5
+  --speaker plughw:1,3
 ```
 
-Press **Enter** to record, speak, and the assistant replies through the speaker.
+Just speak — Silero VAD auto-detects when you start and stop talking.
+Press **Ctrl+C** to exit. For push-to-talk mode, omit `--live` and press **Enter** each turn.
 
 ---
 
@@ -101,7 +103,10 @@ LLM:
 Audio:
   --mic DEVICE            ALSA capture device (default: hw:0,0)
   --speaker DEVICE        ALSA playback device (default: plughw:1,3)
-  --record-seconds N      Recording duration per turn (default: 5)
+  --record-seconds N      Recording duration per turn, push-to-talk mode (default: 5)
+  --live                  Auto-detect speech with Silero VAD (no Enter needed)
+  --silence-duration N    Seconds of silence to end utterance in --live mode (default: 1.5)
+  --vad-threshold N       VAD speech probability threshold 0-1 (default: 0.5)
 
 Output:
   --save-audio FILE       Save TTS audio to WAV file
@@ -115,11 +120,15 @@ Benchmark:
 ### Examples
 
 ```bash
+# Live conversation — VAD auto-detects speech, no button pressing
+python3 pipeline/voice_pipeline.py --live --whisper-speculative --fast-engine \
+  --mic hw:0,0 --speaker plughw:1,3
+
+# Push-to-talk conversation, longer recording window
+python3 pipeline/voice_pipeline.py --whisper-speculative --fast-engine --record-seconds 8
+
 # Single audio file, save spoken response
 python3 pipeline/voice_pipeline.py --audio test_audio.mp3 --save-audio out.wav
-
-# Live conversation, longer recording window
-python3 pipeline/voice_pipeline.py --whisper-speculative --fast-engine --record-seconds 8
 
 # Benchmark 10 runs
 python3 pipeline/voice_pipeline.py --audio test_audio.mp3 --fast-engine \
