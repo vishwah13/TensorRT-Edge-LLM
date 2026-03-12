@@ -3,7 +3,7 @@
 Real-time voice assistant on Jetson AGX Thor: speak a question, get a spoken answer.
 
 ```
-Mic → [Whisper ASR ~1.2s] → [LLM ~9s] → [Piper TTS ~300ms] → Speaker
+Mic → [Whisper ASR ~1.2s] → [LLM ~9s] → [Kokoro TTS ~600ms] → Speaker
 ```
 
 **Tested on:** AGX Thor, JetPack 7.1, NGC pytorch:25.08-py3 container
@@ -22,9 +22,11 @@ docker run -it --gpus all --runtime nvidia --ipc=host \
   nvcr.io/nvidia/pytorch:25.08-py3 bash
 
 # Inside container — install deps (once)
-apt-get update -qq && apt-get install -y -qq ffmpeg alsa-utils
-pip install openai-whisper transformers accelerate piper-tts
-pip install silero-vad --no-deps   # --no-deps keeps CUDA torch 2.8.0 intact
+apt-get update -qq && apt-get install -y -qq ffmpeg espeak-ng
+pip install openai-whisper transformers accelerate
+pip install kokoro-onnx
+pip install "numpy==1.26.4"       # kokoro-onnx upgrades numpy; pin it back
+pip install silero-vad --no-deps  # --no-deps keeps CUDA torch 2.8.0 intact
 
 # Run live conversation (VAD auto-detects speech — no button pressing)
 python3 pipeline/voice_pipeline.py \
@@ -55,7 +57,7 @@ Press **Ctrl+C** to exit. For push-to-talk mode, omit `--live` and press **Enter
 | Mode | Flag | Latency | Notes |
 |------|------|---------|-------|
 | Large-v3 TRT encoder | *(default)* | ~1.7s | Highest accuracy |
-| Medium + small speculative | `--whisper-speculative` | ~1.2s | 23% faster, same accuracy |
+| Medium + small speculative | `--whisper-speculative` | ~1.2s | 23% faster, recommended |
 | Medium TRT encoder | `--whisper-medium` | ~500ms | Requires Phase 3 build |
 
 ### LLM — Qwen3-VL-8B
@@ -65,10 +67,26 @@ Press **Ctrl+C** to exit. For push-to-talk mode, omit `--live` and press **Enter
 | Optimized engine | `--fast-engine` | ~9.2s | maxInputLen=256, maxKV=1024 |
 | EAGLE3 (Qwen2.5-VL-7B) | `--eagle` | ~3-5s | Requires Phase 2 (x86 host first) |
 
-### TTS — Piper
-- Voice: `en_US-lessac-medium` (61MB ONNX, 22050 Hz)
-- Latency: ~230ms short sentence, ~330ms long sentence
-- Real-time factor: 0.04x (40ms to generate 1s of speech)
+### TTS — Kokoro-82M
+- Engine: ONNX (`kokoro/model.onnx`, ~330MB), runs on CPU via onnxruntime
+- Sample rate: **24 kHz**
+- Latency: ~550ms short sentence, ~1100ms long sentence
+- Real-time factor: ~0.05x — 20ms synthesis per 400ms of speech
+
+#### Available Voices
+
+| Voice | Gender | Accent | `--voice` flag |
+|-------|--------|--------|----------------|
+| `af_heart` | Female | US | `--voice af_heart` *(default)* |
+| `af_bella` | Female | US | `--voice af_bella` |
+| `af_nova` | Female | US | `--voice af_nova` |
+| `af_sky` | Female | US | `--voice af_sky` |
+| `am_adam` | Male | US | `--voice am_adam` |
+| `am_echo` | Male | US | `--voice am_echo` |
+| `bf_emma` | Female | British | `--voice bf_emma` |
+| `bm_george` | Male | British | `--voice bm_george` |
+
+Voice files (~500KB each) auto-download on first use to `kokoro/voices/`.
 
 ---
 
@@ -77,8 +95,8 @@ Press **Ctrl+C** to exit. For push-to-talk mode, omit `--live` and press **Enter
 | Config | ASR | LLM | TTS | Total |
 |--------|-----|-----|-----|-------|
 | Baseline | 1,695ms | 10,572ms | — | 12,373ms |
-| `--fast-engine --whisper-speculative` | 1,214ms | 9,230ms | 374ms | **12,056ms** |
-| + EAGLE3 (Phase 2, pending) | ~1,214ms | ~3,000ms | ~374ms | **~5,000ms** |
+| `--fast-engine --whisper-speculative` | 1,214ms | 9,230ms | ~600ms | **~11,000ms** |
+| + EAGLE3 (Phase 2, pending) | ~1,214ms | ~3,000ms | ~600ms | **~5,000ms** |
 
 ---
 
@@ -100,6 +118,13 @@ LLM:
   --eagle                 Use Qwen2.5-VL-7B with EAGLE3 (requires Phase 2)
   --max-tokens N          Max tokens to generate (default: 128)
 
+TTS:
+  --voice NAME            Kokoro voice name (default: af_heart)
+                          Female US: af_heart, af_bella, af_nova, af_sky
+                          Male US:   am_adam, am_echo
+                          Female GB: bf_emma   Male GB: bm_george
+  --no-tts                Skip TTS, print text only
+
 Audio:
   --mic DEVICE            ALSA capture device (default: hw:0,0)
   --speaker DEVICE        ALSA playback device (default: plughw:1,3)
@@ -110,7 +135,6 @@ Audio:
 
 Output:
   --save-audio FILE       Save TTS audio to WAV file
-  --no-tts                Skip TTS, print text only
 
 Benchmark:
   --benchmark N           Run N timed iterations
@@ -123,6 +147,10 @@ Benchmark:
 # Live conversation — VAD auto-detects speech, no button pressing
 python3 pipeline/voice_pipeline.py --live --whisper-speculative --fast-engine \
   --mic hw:0,0 --speaker plughw:1,3
+
+# Try a British accent
+python3 pipeline/voice_pipeline.py --live --whisper-speculative --fast-engine \
+  --mic hw:0,0 --speaker plughw:1,3 --voice bf_emma
 
 # Push-to-talk conversation, longer recording window
 python3 pipeline/voice_pipeline.py --whisper-speculative --fast-engine --record-seconds 8
@@ -169,11 +197,25 @@ Whisper medium + small speculative decoding in pure PyTorch — no engine build 
 python3 pipeline/phase3_whisper_medium.py all
 ```
 
-### Phase 4 — Piper TTS (DONE)
+### Phase 4 — Kokoro TTS (DONE)
+Natural-sounding neural TTS replacing Piper. Uses Kokoro-82M ONNX from HuggingFace.
+
+**Install:**
 ```bash
-bash pipeline/phase4_tts_setup.sh          # install + download voice
+apt-get install -y espeak-ng      # G2P fallback for rare words
+pip install kokoro-onnx
+pip install "numpy==1.26.4"       # pin numpy back — kokoro-onnx upgrades it
 ```
-Voice files: `piper/voices/en_US-lessac-medium/`
+
+**Model files** auto-download to `kokoro/` on first run:
+- `kokoro/model.onnx` — ~330MB, downloaded once
+- `kokoro/voices/<name>.bin` — ~500KB per voice, downloaded on first use
+- `kokoro/voices.npz` — combined voice index, rebuilt automatically
+
+**kokoro-onnx 0.5.0 bugs fixed in code** (`_patch_kokoro_onnx()` in `voice_pipeline.py`):
+- `speed` input dtype: `int32` → `float32` (model expects float)
+- `style` input shape: `(256,)` → `(1, 256)` (model expects rank-2)
+These patches are applied automatically at runtime — no manual edits needed.
 
 ### Phase 5 — FP8 KV Cache (OPTIONAL)
 ```bash
@@ -194,8 +236,14 @@ pipeline/
 ├── phase1_rebuild_engine.sh # Rebuild LLM engine (optimized)
 ├── phase2_eagle_setup.sh    # Qwen2.5-VL-7B + EAGLE3 (host + device)
 ├── phase3_whisper_medium.py # Whisper medium export/build/test
-├── phase4_tts_setup.sh      # Piper TTS install + voice download
 ├── phase5_fp8_kv.sh         # FP8 KV cache (optional)
 ├── test_phase1.py           # Validate Phase 1 speedup
 └── test_phase2.py           # Validate EAGLE3 speedup
+
+kokoro/                      # Auto-created on first TTS run
+├── model.onnx               # Kokoro-82M model (~330MB)
+├── voices.npz               # Combined voice index (auto-built)
+└── voices/
+    ├── af_heart.bin         # Default voice (~500KB)
+    └── <name>.bin           # Additional voices, downloaded on demand
 ```

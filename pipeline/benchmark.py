@@ -73,7 +73,7 @@ def summarize(timings, label=""):
 def compare_all(audio_path, image_path, runs, warmup):
     """Compare all available configurations."""
     from voice_pipeline import (
-        WhisperASR, WhisperASRSpeculative, LLMInference, PiperTTS, VoicePipeline,
+        WhisperASR, WhisperASRSpeculative, LLMInference, KokoroTTS, VoicePipeline,
     )
 
     # Dummy TTS for fair comparison (skip actual audio playback)
@@ -188,7 +188,7 @@ def main():
             eagle=args.eagle,
             fast_engine=args.fast_engine,
             max_tokens=128,
-            voice="en_US-lessac-medium",
+            voice="af_heart",
             no_tts=True,
         )
         pipeline = build_pipeline(pipe_args)

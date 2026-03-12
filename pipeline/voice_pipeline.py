@@ -1,4 +1,4 @@
-"""Voice-to-voice pipeline: Whisper ASR -> LLM -> Piper TTS.
+"""Voice-to-voice pipeline: Whisper ASR -> LLM -> Kokoro TTS.
 
 Orchestrates the full pipeline with sentence-level streaming to TTS.
 Since llm_inference writes output at the end (no token streaming),
@@ -58,6 +58,7 @@ from config import (
     WHISPER_MEDIUM_ENGINE, WHISPER_MEDIUM_ONNX,
     DEFAULT_MAX_GENERATE_LENGTH, DEFAULT_TEMPERATURE, DEFAULT_TOP_K,
     SOT, LANG_EN, TRANSCRIBE, NO_TIMESTAMPS, EOT, WHISPER_MAX_TOKENS,
+    KOKORO_MODEL, KOKORO_VOICES, KOKORO_DIR, KOKORO_DEFAULT_VOICE, KOKORO_SAMPLE_RATE,
 )
 
 
@@ -227,46 +228,141 @@ class LLMInference:
         return text, latency
 
 
-class PiperTTS:
-    """Piper TTS wrapper for text-to-speech synthesis."""
+class KokoroTTS:
+    """Kokoro-82M ONNX TTS — 24kHz, natural voices, no torch dependency.
 
-    def __init__(self, voice_name="en_US-lessac-medium", voices_dir=None):
-        voices_dir = voices_dir or os.path.join(WORKSPACE, "piper/voices")
-        self.model_path = os.path.join(voices_dir, voice_name, f"{voice_name}.onnx")
-        self._voice = None
+    Voices — Female US: af_heart (default), af_bella, af_nova, af_sky
+             Male US:   am_adam, am_echo
+             Female GB: bf_emma   Male GB: bm_george
+    """
 
-        if not os.path.exists(self.model_path):
-            print(f"[TTS] Voice not found: {self.model_path}")
-            print("[TTS] Run: bash pipeline/phase4_tts_setup.sh")
-            self._available = False
-        else:
-            self._available = True
-            print(f"[TTS] Voice: {voice_name}")
+    HF_BASE = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main"
 
-    def _get_voice(self):
-        if self._voice is None and self._available:
-            from piper import PiperVoice
-            self._voice = PiperVoice.load(self.model_path)
-        return self._voice
+    def __init__(self, voice_name=KOKORO_DEFAULT_VOICE, kokoro_dir=None):
+        self._voice_name = voice_name
+        self._kokoro_dir = kokoro_dir or KOKORO_DIR
+        self._kokoro = None  # lazy-loaded
+        self._voices_npz = os.path.join(self._kokoro_dir, "voices.npz")
+        self._available = self._ensure_model()
+        if self._available:
+            print(f"[TTS] Kokoro voice: {voice_name} (24kHz)")
+
+    def _ensure_model(self):
+        import shutil
+        import numpy as np
+        from huggingface_hub import hf_hub_download
+        repo = "onnx-community/Kokoro-82M-v1.0-ONNX"
+        voices_dir = os.path.join(self._kokoro_dir, "voices")
+        os.makedirs(voices_dir, exist_ok=True)
+
+        # Model ONNX — use model.onnx (fp32); model_fp16.onnx has int32/float speed mismatch
+        model_dest = os.path.join(self._kokoro_dir, "model.onnx")
+        if not os.path.exists(model_dest):
+            print("[TTS] Downloading Kokoro model (~330MB)...")
+            try:
+                cached = hf_hub_download(repo_id=repo, filename="onnx/model.onnx")
+                shutil.copy2(cached, model_dest)
+            except Exception as e:
+                print(f"[TTS] Model download failed: {e}")
+                return False
+
+        # Per-voice .bin file (one per voice name)
+        voice_bin = os.path.join(voices_dir, f"{self._voice_name}.bin")
+        if not os.path.exists(voice_bin):
+            print(f"[TTS] Downloading voice {self._voice_name}...")
+            try:
+                cached = hf_hub_download(
+                    repo_id=repo, filename=f"voices/{self._voice_name}.bin"
+                )
+                shutil.copy2(cached, voice_bin)
+            except Exception as e:
+                print(f"[TTS] Voice download failed: {e}")
+                return False
+
+        # kokoro-onnx does np.load(voices_path)[voice_name] — build a .npz from
+        # all downloaded .bin files. Each .bin is raw float32, shape (510, 256).
+        voices_data = {}
+        for fname in os.listdir(voices_dir):
+            if fname.endswith(".bin"):
+                try:
+                    raw = np.frombuffer(
+                        open(os.path.join(voices_dir, fname), "rb").read(),
+                        dtype=np.float32,
+                    ).reshape(-1, 256)
+                    voices_data[fname[:-4]] = raw
+                except Exception:
+                    pass
+        np.savez(self._voices_npz, **voices_data)
+        return True
+
+    @staticmethod
+    def _patch_kokoro_onnx():
+        """Fix two bugs in kokoro-onnx 0.5.0 that affect the ONNX models:
+        1. speed passed as int32 but model expects float32
+        2. style passed as rank-1 (256,) but model expects rank-2 (1, 256)
+        Applied once at import time; safe to call repeatedly.
+        """
+        import types
+        import numpy as np
+        import kokoro_onnx as _kmod
+        orig = _kmod.Kokoro._create_audio
+
+        def _patched(self, phonemes, voice, speed):
+            import numpy as _np
+            tokens = _np.array(self.tokenizer.tokenize(phonemes[:511]), dtype=_np.int64)
+            style_vec = voice[len(tokens)][_np.newaxis, :]   # (1, 256) — rank-2
+            tokens = [[0, *tokens.tolist(), 0]]
+            inputs = {
+                "input_ids": tokens,
+                "style": _np.array(style_vec, dtype=_np.float32),
+                "speed": _np.array([speed], dtype=_np.float32),  # float32 not int32
+            }
+            import onnxruntime as _rt
+            audio = self.sess.run(None, inputs)[0]
+            from kokoro_onnx.config import SAMPLE_RATE
+            return audio, SAMPLE_RATE
+
+        if not getattr(_kmod.Kokoro._create_audio, "_patched", False):
+            _kmod.Kokoro._create_audio = _patched
+            _kmod.Kokoro._create_audio._patched = True
+
+    def _get_kokoro(self):
+        if self._kokoro is None and self._available:
+            try:
+                from kokoro_onnx import Kokoro
+                self._patch_kokoro_onnx()
+                self._kokoro = Kokoro(
+                    os.path.join(self._kokoro_dir, "model.onnx"),
+                    self._voices_npz,
+                )
+            except ImportError:
+                print("[TTS] kokoro-onnx not installed. Run: pip install kokoro-onnx")
+                self._available = False
+        return self._kokoro
 
     def synthesize(self, text):
         """Synthesize text to WAV file. Returns (wav_path, latency_ms)."""
-        voice = self._get_voice()
-        if voice is None:
+        kokoro = self._get_kokoro()
+        if kokoro is None:
             return None, 0
-
-        wav_path = tempfile.mktemp(suffix=".wav")
         t0 = time.perf_counter()
-        audio_bytes = b""
-        for chunk in voice.synthesize(text):
-            audio_bytes += chunk.audio_int16_bytes
+        try:
+            samples, sample_rate = kokoro.create(
+                text, voice=self._voice_name, speed=1.0, lang="en-us"
+            )
+        except Exception as e:
+            print(f"[TTS] Synthesis error: {e}")
+            return None, 0
         latency = (time.perf_counter() - t0) * 1000
 
+        import numpy as np
+        samples_int16 = (samples * 32767).clip(-32768, 32767).astype(np.int16)
+        wav_path = tempfile.mktemp(suffix=".wav")
         with wave.open(wav_path, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            wav.setframerate(voice.config.sample_rate)
-            wav.writeframes(audio_bytes)
+            wav.setframerate(sample_rate)
+            wav.writeframes(samples_int16.tobytes())
         return wav_path, latency
 
     def synthesize_and_play(self, text, speaker_device=None):
@@ -275,8 +371,6 @@ class PiperTTS:
         if wav_path is None:
             print(f"  [TTS unavailable] {text}")
             return 0
-
-        # Play audio if aplay is available (headless environments skip playback)
         play_ms = 0
         try:
             cmd = ["aplay", "-q"]
@@ -287,8 +381,7 @@ class PiperTTS:
             subprocess.run(cmd, capture_output=True, check=True)
             play_ms = (time.perf_counter() - t0) * 1000
         except (FileNotFoundError, subprocess.CalledProcessError):
-            pass  # No audio device — TTS latency is still measured
-
+            pass
         os.unlink(wav_path)
         return synth_ms + play_ms
 
@@ -743,8 +836,9 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_GENERATE_LENGTH)
 
     # TTS config
-    parser.add_argument("--voice", default="en_US-lessac-medium",
-                        help="Piper TTS voice name")
+    parser.add_argument("--voice", default="af_heart",
+                        help="Kokoro TTS voice. Female US: af_heart (default), af_bella, af_nova, af_sky. "
+                             "Male US: am_adam, am_echo. Female GB: bf_emma. Male GB: bm_george.")
     parser.add_argument("--no-tts", action="store_true",
                         help="Disable TTS output")
 
@@ -796,13 +890,13 @@ def build_pipeline(args):
 
     # TTS
     if args.no_tts:
-        tts = PiperTTS.__new__(PiperTTS)
+        tts = KokoroTTS.__new__(KokoroTTS)
         tts._available = False
-        tts._voice = None
+        tts._kokoro = None
         tts.synthesize = lambda text: (None, 0)
         tts.synthesize_and_play = lambda text, speaker_device=None: 0
     else:
-        tts = PiperTTS(voice_name=args.voice)
+        tts = KokoroTTS(voice_name=args.voice)
 
     return VoicePipeline(asr, llm, tts)
 

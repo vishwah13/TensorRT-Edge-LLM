@@ -52,8 +52,11 @@ WHISPER_MEDIUM_ONNX = os.path.join(WORKSPACE, "whisper-medium/onnx")
 WHISPER_MEDIUM_ENGINE = os.path.join(WORKSPACE, "whisper-medium/engines/encoder.engine")
 
 # --- TTS (Phase 4) ---
-PIPER_VOICES_DIR = os.path.join(WORKSPACE, "piper/voices")
-PIPER_DEFAULT_VOICE = "en_US-lessac-medium"
+KOKORO_DIR = os.path.join(WORKSPACE, "kokoro")
+KOKORO_MODEL = os.path.join(WORKSPACE, "kokoro/model_fp16.onnx")
+KOKORO_VOICES = os.path.join(WORKSPACE, "kokoro/voices-v1.0.bin")
+KOKORO_DEFAULT_VOICE = "af_heart"
+KOKORO_SAMPLE_RATE = 24000
 
 # --- Pipeline defaults ---
 DEFAULT_MAX_GENERATE_LENGTH = 128
